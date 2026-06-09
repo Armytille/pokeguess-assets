@@ -1,0 +1,39 @@
+# .github/workflows/warm-jsdelivr.yml
+# Keeps the PokeGuess sprite cache HOT on jsDelivr edges.
+#
+# jsDelivr has no prefetch API: the only way to keep an edge PoP warm is to keep
+# requesting the files. The pinned tag (@v2) is immutable and frozen, so there is
+# no "new release" to react to — this is a pure time-based heartbeat that counters
+# regional LRU eviction. Runs every 6h; also runnable on demand.
+
+name: warm-jsdelivr
+
+on:
+  schedule:
+    # Every 6 hours, at minute 17 (off the top of the hour to avoid the cron
+    # rush where GitHub delays/ drops :00 jobs under load).
+    - cron: '17 */6 * * *'
+  workflow_dispatch: # manual "Run workflow" button for on-demand warming
+
+# A new run supersedes an in-progress one — no point stacking warm-ups.
+concurrency:
+  group: warm-jsdelivr
+  cancel-in-progress: true
+
+jobs:
+  warm:
+    runs-on: ubuntu-latest # GitHub's hosted runners are US-based → warms the US networks natively
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20' # global fetch() + AbortController, no deps
+
+      - name: Warm all provider networks
+        # Default providers: cdn.jsdelivr.net (Cloudflare/Bunny via the balancer),
+        # fastly, gcore (Asia/JP), quantil (China). HEAD requests populate the edge
+        # cache for zero body bytes. Runner is US-based → warms the US edges; the
+        # forced-provider hosts warm each provider's network regardless.
+        run: node scripts/warm-jsdelivr.mjs --concurrency 24 --retries 2
