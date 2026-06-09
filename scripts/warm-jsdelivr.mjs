@@ -21,6 +21,11 @@
 // each provider keeps its own cache, so covering all of them covers the networks
 // real users land on.
 //
+// NOTE on regional coverage: from one machine, jsDelivr GeoDNS routes you to the
+// PoP nearest YOU, so a US runner only warms US edges. To warm EU/JP edges too,
+// run this through a country-pinned egress (see .github/workflows/warm-jsdelivr-tor.yml,
+// which tunnels this same script through Tor exit nodes in DE/JP).
+//
 // REQUESTS
 // We use HEAD, not GET: a HEAD populates the edge cache entry just like a GET but
 // transfers zero body bytes — so warming 2050 files × 4 hosts costs ~8200 tiny
@@ -77,7 +82,7 @@ const DEFAULT_PROVIDERS = ['default', 'fastly', 'gcore', 'quantil'];
 
 // ── CLI args ───────────────────────────────────────────────────────────────────
 function parseArgs(argv) {
-  const args = { providers: [...DEFAULT_PROVIDERS], concurrency: 24, dryRun: false, timeoutMs: 15000, retries: 2 };
+  const args = { providers: [...DEFAULT_PROVIDERS], concurrency: 24, dryRun: false, timeoutMs: 15000, retries: 2, maxErrorRate: 0.05 };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--dry-run') args.dryRun = true;
@@ -85,6 +90,10 @@ function parseArgs(argv) {
     else if (a === '--concurrency') args.concurrency = Math.max(1, parseInt(argv[++i], 10) || 24);
     else if (a === '--timeout') args.timeoutMs = Math.max(1000, parseInt(argv[++i], 10) || 15000);
     else if (a === '--retries') args.retries = Math.max(0, parseInt(argv[++i], 10) || 0);
+    // Fraction of requests allowed to fail before the run exits non-zero. Default
+    // 5% for the reliable direct pipeline; raise it (e.g. 0.5) for flaky transports
+    // like Tor where a partial warm is still a useful warm.
+    else if (a === '--max-error-rate') args.maxErrorRate = Math.min(1, Math.max(0, parseFloat(argv[++i]) || 0.05));
     else if (a === '--help' || a === '-h') { printHelp(); process.exit(0); }
   }
   const unknown = args.providers.filter((p) => !PROVIDER_HOSTS[p]);
@@ -102,6 +111,7 @@ function printHelp() {
   --concurrency <n>     parallel in-flight HEAD requests per provider (default: 24)
   --timeout <ms>        per-request timeout (default: 15000)
   --retries <n>         transient-failure retries per URL (default: 2)
+  --max-error-rate <f>  fail the run above this error fraction (default: 0.05)
   --dry-run             print the plan, make no requests
   -h, --help            this help`);
 }
@@ -248,10 +258,11 @@ async function main() {
   console.log(`  note: a high MISS rate on the FIRST run is expected — those requests`);
   console.log(`        just warmed the edge. The next run should report mostly HIT.`);
 
-  // Fail the CI job only if a large fraction of files were truly unreachable
-  // (genuine 4xx / persistent network failure) — a healthy warm run never does.
-  if (totErr > totalReq * 0.05) {
-    console.error(`\nFAIL: ${totErr} errors exceed 5% of ${totalReq} requests.`);
+  // Fail the CI job only if too large a fraction of files were unreachable. The
+  // threshold is configurable (--max-error-rate) so flaky transports like Tor can
+  // tolerate a higher miss rate while the direct pipeline stays strict at 5%.
+  if (totErr > totalReq * args.maxErrorRate) {
+    console.error(`\nFAIL: ${totErr} errors exceed ${(args.maxErrorRate * 100).toFixed(0)}% of ${totalReq} requests.`);
     process.exit(1);
   }
 }
