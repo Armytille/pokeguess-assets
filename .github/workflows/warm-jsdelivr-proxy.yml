@@ -40,7 +40,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          # Node 24: --use-env-proxy (used by the script's proxy re-exec) needs
+          # >= 22.21.0 or >= 24.5.0. Node 20 errors with "bad option: --use-env-proxy".
+          node-version: '24'
 
       - name: Warm each proxy region
         env:
