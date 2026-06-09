@@ -12,19 +12,14 @@
 // first-install download slowness we're fixing. Running this on a cron keeps the
 // 2050 WebP artworks warm so real users always hit a warm edge (~30ms/file).
 //
-// HOW IT REACHES MULTIPLE REGIONS FROM ONE MACHINE
+// HOW IT REACHES MULTIPLE REGIONS
 // jsDelivr is multi-CDN. The default host (cdn.jsdelivr.net) load-balances to one
 // provider, but the others are ALSO addressable directly by hostname. Hitting them
-// all from a single runner warms each provider's network — including Quantil, the
-// only provider reachable inside China (behind the Great Firewall), and Cloudflare/
-// Bunny via the default host. The exact PoP still depends on the runner's geo, but
-// each provider keeps its own cache, so covering all of them covers the networks
-// real users land on.
-//
-// NOTE on regional coverage: from one machine, jsDelivr GeoDNS routes you to the
-// PoP nearest YOU, so a US runner only warms US edges. To warm EU/JP edges too,
-// run this through a country-pinned egress (see .github/workflows/warm-jsdelivr-tor.yml,
-// which tunnels this same script through Tor exit nodes in DE/JP).
+// all warms each provider's network — including Quantil (China, behind the Great
+// Firewall) and Cloudflare/Bunny via the default host. BUT GeoDNS routes you to the
+// PoP nearest the sender, so a US runner only warms US edges. To warm EU/JP/etc.,
+// pass --proxy pointing at a proxy in that region (see the --proxy notes below): the
+// request then exits from there and warms that region's PoP.
 //
 // REQUESTS
 // We use HEAD, not GET: a HEAD populates the edge cache entry just like a GET but
@@ -37,6 +32,7 @@
 //   node warm-jsdelivr.mjs                # warm all providers, full report
 //   node warm-jsdelivr.mjs --providers fastly,quantil
 //   node warm-jsdelivr.mjs --concurrency 32
+//   node warm-jsdelivr.mjs --proxy http://user:pass@host:port   # warm via a region
 //   node warm-jsdelivr.mjs --dry-run      # print the plan, make no requests
 //
 // Pinned to the same frozen tag the app uses (constants.ts ASSETS_SPRITES_REV).
@@ -44,6 +40,11 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { lookup } from 'node:dns/promises';
+import { createRequire } from 'node:module';
+
+// `require` shim for this ES module — needed only for the one-time proxy re-exec
+// (spawnSync from node:child_process). Kept at top level; imports hoist anyway.
+const require = createRequire(import.meta.url);
 
 // ── Config (keep in sync with src/utils/constants.ts) ──────────────────────────
 const ASSETS_REPO = 'Armytille/pokeguess-assets';
@@ -64,11 +65,11 @@ const ARTWORK_TOTAL = 1025; // IDs 1..1025 (gens 1–9)
 const PROVIDER_HOSTS = {
   // The DEFAULT load-balanced host — the exact one the app uses (constants.ts
   // ASSETS_BASE). It routes to whichever provider jsDelivr's balancer picks for
-  // THIS runner's geo/perf (commonly Cloudflare or Bunny), so it's how we warm
+  // THIS sender's geo/perf (commonly Cloudflare or Bunny), so it's how we warm
   // the Cloudflare/Bunny networks: there is no `cloudflare.jsdelivr.net` host to
   // force (it doesn't resolve), but `cdn.jsdelivr.net` reaches Cloudflare when the
   // balancer prefers it. From a US runner this warms the US edge of whatever it
-  // picks; from EU, the EU edge.
+  // picks; through an EU proxy, the EU edge.
   default:    'cdn.jsdelivr.net',
   fastly:     'fastly.jsdelivr.net',
   gcore:      'gcore.jsdelivr.net',
@@ -82,7 +83,7 @@ const DEFAULT_PROVIDERS = ['default', 'fastly', 'gcore', 'quantil'];
 
 // ── CLI args ───────────────────────────────────────────────────────────────────
 function parseArgs(argv) {
-  const args = { providers: [...DEFAULT_PROVIDERS], concurrency: 24, dryRun: false, timeoutMs: 15000, retries: 2, maxErrorRate: 0.05 };
+  const args = { providers: [...DEFAULT_PROVIDERS], concurrency: 24, dryRun: false, timeoutMs: 15000, retries: 2, maxErrorRate: 0.05, proxy: process.env.WARM_PROXY || '' };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--dry-run') args.dryRun = true;
@@ -92,8 +93,15 @@ function parseArgs(argv) {
     else if (a === '--retries') args.retries = Math.max(0, parseInt(argv[++i], 10) || 0);
     // Fraction of requests allowed to fail before the run exits non-zero. Default
     // 5% for the reliable direct pipeline; raise it (e.g. 0.5) for flaky transports
-    // like Tor where a partial warm is still a useful warm.
+    // where a partial warm is still a useful warm.
     else if (a === '--max-error-rate') args.maxErrorRate = Math.min(1, Math.max(0, parseFloat(argv[++i]) || 0.05));
+    // Route all requests through an HTTP proxy (e.g. http://user:pass@host:port).
+    // This is how we warm NON-US edges: a proxy in DE/JP makes jsDelivr's GeoDNS
+    // see that region's IP AND resolves DNS proxy-side, so routing matches the
+    // exit geo (unlike Tor, where Node's local DNS leaked the US location). Can
+    // also be set via the WARM_PROXY env var (preferred in CI to keep creds out
+    // of the process args / logs).
+    else if (a === '--proxy') args.proxy = argv[++i] || '';
     else if (a === '--help' || a === '-h') { printHelp(); process.exit(0); }
   }
   const unknown = args.providers.filter((p) => !PROVIDER_HOSTS[p]);
@@ -112,6 +120,8 @@ function printHelp() {
   --timeout <ms>        per-request timeout (default: 15000)
   --retries <n>         transient-failure retries per URL (default: 2)
   --max-error-rate <f>  fail the run above this error fraction (default: 0.05)
+  --proxy <url>         route via HTTP proxy http://user:pass@host:port
+                        (or set WARM_PROXY env var) — warms that proxy's region
   --dry-run             print the plan, make no requests
   -h, --help            this help`);
 }
@@ -211,12 +221,58 @@ async function resolvableProviders(providers) {
   return live;
 }
 
+// ── Proxy re-exec ──────────────────────────────────────────────────────────────
+// Node only honors a proxy for the native `fetch` when started with
+// `--use-env-proxy` and HTTPS_PROXY/HTTP_PROXY set in the environment (there is no
+// runtime API to enable it, and the `undici` package isn't importable). So when a
+// proxy is requested we re-launch ourselves once with those set, marking the child
+// via WARM_PROXY_ACTIVE so it doesn't re-exec again. Credentials live in the env,
+// never on the command line (keeps them out of `ps` / CI logs).
+function reExecWithProxy(proxyUrl) {
+  const { spawnSync } = require('node:child_process');
+  // Drop --proxy + its value so the child doesn't loop; it reads the proxy from env.
+  const childArgs = [];
+  const orig = process.argv.slice(2);
+  for (let i = 0; i < orig.length; i++) {
+    if (orig[i] === '--proxy') { i++; continue; } // skip flag + its value
+    childArgs.push(orig[i]);
+  }
+  const res = spawnSync(process.execPath, ['--use-env-proxy', process.argv[1], ...childArgs], {
+    stdio: 'inherit',
+    env: {
+      ...process.env,
+      HTTPS_PROXY: proxyUrl,
+      HTTP_PROXY: proxyUrl,
+      NODE_USE_ENV_PROXY: '1',
+      WARM_PROXY_ACTIVE: proxyUrl,
+    },
+  });
+  process.exit(res.status ?? 1);
+}
+
 // ── Main ─────────────────────────────────────────────────────────────────────
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const paths = buildPaths();
 
-  if (!args.dryRun) {
+  // Proxy routing uses Node's native env-proxy support, NOT the `undici` package
+  // (which is bundled into `fetch` but is NOT importable as a bare module — that
+  // would crash in CI). When --proxy is given we set HTTPS_PROXY/HTTP_PROXY in the
+  // env and re-exec under `node --use-env-proxy`, which makes the global `fetch`
+  // tunnel through the proxy AND resolve DNS proxy-side — so jsDelivr GeoDNS sees
+  // the proxy's region (the whole point) instead of the runner's. See reExecWithProxy.
+  if (args.proxy && !process.env.WARM_PROXY_ACTIVE) {
+    return reExecWithProxy(args.proxy);
+  }
+  if (process.env.WARM_PROXY_ACTIVE) {
+    const safe = process.env.WARM_PROXY_ACTIVE.replace(/\/\/[^@]*@/, '//***@');
+    console.log(`  proxy:       ${safe}`);
+  }
+
+  // Skip the local DNS pre-check when proxying: resolution happens proxy-side, so
+  // a local `lookup` would wrongly drop providers (this is exactly the failure the
+  // Tor attempt hit). Without a proxy, keep the pre-check to prune dead hosts.
+  if (!args.dryRun && !process.env.WARM_PROXY_ACTIVE) {
     args.providers = await resolvableProviders(args.providers);
     if (args.providers.length === 0) {
       console.error('No provider hostnames resolved — nothing to warm.');
@@ -259,8 +315,8 @@ async function main() {
   console.log(`        just warmed the edge. The next run should report mostly HIT.`);
 
   // Fail the CI job only if too large a fraction of files were unreachable. The
-  // threshold is configurable (--max-error-rate) so flaky transports like Tor can
-  // tolerate a higher miss rate while the direct pipeline stays strict at 5%.
+  // threshold is configurable (--max-error-rate) so flaky transports tolerate a
+  // higher miss rate while the direct pipeline stays strict at 5%.
   if (totErr > totalReq * args.maxErrorRate) {
     console.error(`\nFAIL: ${totErr} errors exceed ${(args.maxErrorRate * 100).toFixed(0)}% of ${totalReq} requests.`);
     process.exit(1);
