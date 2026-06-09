@@ -40,7 +40,10 @@ concurrency:
 jobs:
   warm-proxy:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 60 min: free shared proxies run ~8-10 min/region, and we warm 5 regions
+    # sequentially (parallel would hammer the shared proxy pool). 30 min was too
+    # short — it cut off mid-run after ~3 regions. GitHub free minutes are ample.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
