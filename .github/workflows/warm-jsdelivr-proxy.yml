@@ -25,8 +25,13 @@ name: warm-jsdelivr-proxy
 
 on:
   schedule:
-    - cron: '47 */12 * * *' # every 12h, offset from the base US warm-up
-  workflow_dispatch:
+    # Weekly (Sun 04:47 UTC). Each run is ~5 regions × 3 providers × 2050 HEAD
+    # ≈ 30.7k requests ≈ ~150 MB of proxy traffic. Webshare's free tier is 1 GB/mo,
+    # so weekly (~4-5 runs/mo ≈ 600-750 MB) stays comfortably under quota. The
+    # immutable @v2 tag means edges, once warm, only need a periodic top-up against
+    # LRU eviction — weekly is enough. Bump frequency only with a paid bandwidth plan.
+    - cron: '47 4 * * 0'
+  workflow_dispatch: # manual run anytime (doesn't count against the weekly cadence)
 
 concurrency:
   group: warm-jsdelivr-proxy
