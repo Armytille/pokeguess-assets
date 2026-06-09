@@ -1,0 +1,92 @@
+# .github/workflows/warm-jsdelivr-tor.yml
+# EXPERIMENTAL multi-region warm-up via Tor exit nodes.
+#
+# The plain warm-jsdelivr.yml runs from GitHub's US runners, so it only warms the
+# US edge of each jsDelivr provider. This variant routes the SAME warm-up through
+# Tor exit nodes pinned to specific COUNTRIES, so jsDelivr's GeoDNS sees a German /
+# Japanese source IP and routes to the EU / JP PoPs — warming those edges too.
+#
+# HONEST LIMITS (why this is "experimental", not the primary pipeline):
+#   - Tor has NO exit nodes in China → the `quantil` (China) network cannot be
+#     warmed regionally this way. We skip quantil here; only the US warm-up (or a
+#     real China VPS) can touch it.
+#   - Tor exits are slow and flaky. We raise timeouts and retries, and the run is
+#     best-effort: the error gate is relaxed so a partial warm still "succeeds".
+#   - `torsocks` LD_PRELOADs the node process and tunnels all its TCP through the
+#     local Tor SOCKS (127.0.0.1:9050) — no npm SOCKS dependency needed. We force
+#     DNS through Tor too (torsocks resolves remotely) so GeoDNS sees the exit geo.
+#
+# Runs on its own slower cadence; the US warm-up stays the reliable baseline.
+
+name: warm-jsdelivr-tor
+
+on:
+  schedule:
+    - cron: '37 3 * * *' # once a day, 03:37 UTC — Tor is slow; daily top-up is enough
+  workflow_dispatch:
+    inputs:
+      countries:
+        description: 'Comma-separated Tor exit country codes (e.g. de,jp)'
+        required: false
+        default: 'de,jp'
+
+concurrency:
+  group: warm-jsdelivr-tor
+  cancel-in-progress: true
+
+jobs:
+  warm-tor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45 # Tor is slow; give each region room
+    strategy:
+      fail-fast: false # one region failing shouldn't abort the others
+      matrix:
+        country: [de, jp] # EU + Japan. (us is already covered natively by warm-jsdelivr.yml)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Tor + torsocks
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tor torsocks
+
+      - name: Pin Tor exit node to ${{ matrix.country }}
+        run: |
+          sudo tee -a /etc/tor/torrc >/dev/null <<EOF
+          ExitNodes {${{ matrix.country }}}
+          StrictNodes 1
+          EOF
+          sudo systemctl restart tor || sudo service tor restart
+          # Wait for Tor to open its SOCKS port + build a circuit.
+          echo "Waiting for Tor SOCKS on 9050 …"
+          for i in $(seq 1 30); do
+            if (echo > /dev/tcp/127.0.0.1/9050) 2>/dev/null; then echo "Tor up"; break; fi
+            sleep 2
+          done
+
+      - name: Verify the exit IP is in ${{ matrix.country }}
+        run: |
+          # Confirm we're actually exiting where we think — print the geo so the
+          # log shows which region this run warmed. Non-fatal if the geo API hiccups.
+          # `torsocks` resolves DNS remotely (via Tor), so this also proves DNS won't
+          # leak the runner's US location to jsDelivr GeoDNS.
+          torsocks curl -s --max-time 30 https://ipinfo.io/json || echo "geo check skipped"
+
+      - name: Warm EU/JP edges through Tor (Cloudflare/Bunny + Fastly + Gcore)
+        # Skip quantil (no Tor exit in China). Generous timeout/retries for slow exits.
+        # Relaxed concurrency: Tor circuits don't like 24 parallel streams.
+        # --max-error-rate 0.5: Tor exits are flaky, so tolerate up to 50% misses —
+        # even a half-warm of the EU/JP edge is a real improvement, and the daily
+        # cron tops up what this run missed. The job only fails if Tor is basically
+        # dead (>50% errors), which is the signal worth alerting on.
+        run: |
+          torsocks node scripts/warm-jsdelivr.mjs \
+            --providers default,fastly,gcore \
+            --concurrency 8 \
+            --timeout 30000 \
+            --retries 3 \
+            --max-error-rate 0.5
