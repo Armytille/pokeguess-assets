@@ -1,0 +1,80 @@
+# .github/workflows/warm-jsdelivr-proxy.yml
+# Multi-region warm-up through Webshare (or any) HTTP proxies.
+#
+# The base warm-jsdelivr.yml runs from GitHub's US runners, so it only warms the
+# US edge of each jsDelivr provider. This workflow routes the SAME warm-up through
+# one or more HTTP proxies in other regions, so jsDelivr's GeoDNS sees each proxy's
+# IP and routes to that region's PoP — warming EU / JP / etc. edges too.
+#
+# SETUP (one-time):
+#   1. Create a free Webshare account (10 datacenter proxies, 1 GB/mo).
+#   2. Dashboard -> Proxy List -> copy in "host:port:user:pass" format (one/line).
+#   3. Repo -> Settings -> Secrets and variables -> Actions -> New repository secret:
+#        Name:  WEBSHARE_PROXIES
+#        Value: paste the lines, ONE proxy per line, e.g.
+#                 1.2.3.4:8080:myuser:mypass
+#                 5.6.7.8:8080:myuser:mypass
+#      (The free tier doesn't let you pick countries -- paste what you got and the
+#       run logs each proxy's geo so you can SEE which regions you're covering.)
+#
+# If the secret is empty/unset, the job no-ops cleanly (no failure).
+# China is NOT covered (Webshare free has no China datacenter IPs); the US base
+# pipeline still warms quantil from the US side.
+
+name: warm-jsdelivr-proxy
+
+on:
+  schedule:
+    - cron: '47 */12 * * *' # every 12h, offset from the base US warm-up
+  workflow_dispatch:
+
+concurrency:
+  group: warm-jsdelivr-proxy
+  cancel-in-progress: true
+
+jobs:
+  warm-proxy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Warm each proxy region
+        env:
+          WEBSHARE_PROXIES: ${{ secrets.WEBSHARE_PROXIES }}
+        run: |
+          if [ -z "${WEBSHARE_PROXIES}" ]; then
+            echo "WEBSHARE_PROXIES secret is empty — nothing to warm. Set it to enable multi-region warming."
+            exit 0
+          fi
+          # Iterate proxies, one warm-up per region. Webshare's copy format is
+          # host:port:user:pass — convert to the http://user:pass@host:port URL the
+          # script expects, passed via WARM_PROXY env (keeps creds out of argv/logs).
+          echo "${WEBSHARE_PROXIES}" | while IFS= read -r line; do
+            line="$(echo "$line" | tr -d '\r' | xargs)"   # trim CR/whitespace
+            [ -z "$line" ] && continue
+            host="$(echo "$line" | cut -d: -f1)"
+            port="$(echo "$line" | cut -d: -f2)"
+            user="$(echo "$line" | cut -d: -f3)"
+            pass="$(echo "$line" | cut -d: -f4)"
+            echo ""
+            echo "=================================================================="
+            echo " Warming via proxy ${host}:${port}"
+            # Show the proxy's geo so the log proves which region this warmed.
+            geo="$(curl -s --max-time 20 --proxy "http://${user}:${pass}@${host}:${port}" https://ipinfo.io/json | tr -d '\n' || echo '{}')"
+            echo " exit geo: ${geo}"
+            echo "=================================================================="
+            # gcore + quantil are best forced by hostname; default warms Cloudflare/
+            # Bunny in this region. The strict DNS pre-check is auto-skipped under proxy.
+            WARM_PROXY="http://${user}:${pass}@${host}:${port}" \
+              node scripts/warm-jsdelivr.mjs \
+                --providers default,fastly,gcore \
+                --concurrency 12 \
+                --timeout 20000 \
+                --retries 3 \
+                --max-error-rate 0.3 \
+            || echo "proxy ${host}:${port} finished best-effort"
+          done
