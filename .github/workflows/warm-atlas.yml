@@ -1,0 +1,51 @@
+# .github/workflows/warm-atlas.yml
+# Keeps the PokeGuess Atlas scenes HOT on jsDelivr edges.
+#
+# The app downloads every Atlas scene (~12,000 files, Armytille/pokeguess-atlas,
+# one tag <catalog version>-NN per 35 Pokémon) on its loading screen. A cold file
+# comes from the GitHub origin (seconds per file); a warm one from the edge
+# (tens of ms). Same heartbeat as warm-jsdelivr.yml for the sprites: HEAD
+# requests from GitHub's US runners every 6 hours. The script finds the newest
+# catalog's tags itself, so a new catalog needs no change here.
+
+name: warm-atlas
+
+on:
+  schedule:
+    # Every 6 hours at minute 37: off the hour, and 20 minutes after the sprite run.
+    - cron: '37 */6 * * *'
+  # The day a new catalog is published, run it by hand to warm it at once.
+  workflow_dispatch:
+    inputs:
+      versions:
+        description: 'How many of the newest catalog versions to warm'
+        required: false
+        default: '1'
+
+concurrency:
+  group: warm-atlas
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  warm:
+    runs-on: ubuntu-latest
+    # ~12,000 files × 4 providers. A cold catalog takes longest (each MISS waits on
+    # the origin); a warm one goes in a few minutes per provider.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Warm all provider networks
+        env:
+          # Read-only GitHub API calls (tag list, one tree per tag): the job's own
+          # token lifts the anonymous limit of 60 requests an hour.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSIONS: ${{ github.event.inputs.versions || '1' }}
+        run: node scripts/warm-jsdelivr.mjs --target atlas --atlas-versions "$VERSIONS" --concurrency 32 --retries 2
