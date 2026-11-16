@@ -34,9 +34,19 @@
 //   node warm-jsdelivr.mjs --concurrency 32
 //   node warm-jsdelivr.mjs --proxy http://user:pass@host:port   # warm via a region
 //   node warm-jsdelivr.mjs --dry-run      # print the plan, make no requests
+//   node warm-jsdelivr.mjs --target atlas # the Atlas scenes instead of the sprites
 //
-// Pinned to the same frozen tag the app uses (constants.ts ASSETS_SPRITES_REV).
-// The tag is immutable, so this is safe to run forever without coordination.
+// TARGETS
+// `sprites` (default): pinned to the same frozen tag the app uses (constants.ts
+// ASSETS_SPRITES_REV). The tag is immutable, so this is safe to run forever
+// without coordination.
+// `atlas`: the Atlas Pokémon scenes of Armytille/pokeguess-atlas, which the app
+// downloads in full on its loading screen (~12,000 files per catalog). The repo
+// holds one tag `<catalog version>-NN` per 35 Pokémon (jsDelivr refuses a ref
+// over 50 MB). The script finds the newest catalog versions itself through the
+// GitHub API (`--atlas-versions`, default 1: the catalog the builds carry;
+// pass 2 while two catalogs are in use) and lists each tag's files, so a new catalog needs no change here. Set
+// GITHUB_TOKEN to lift the API's anonymous limit (60 requests/hour).
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { lookup } from 'node:dns/promises';
@@ -51,6 +61,11 @@ const ASSETS_REPO = 'Armytille/pokeguess-assets';
 const ASSETS_TAG  = 'v2'; // ASSETS_SPRITES_REV — frozen, won't change
 const ARTWORK_PATH = 'sprites/official-artwork';
 const ARTWORK_TOTAL = 1025; // IDs 1..1025 (gens 1–9)
+
+// Atlas scenes (keep in sync with eas.json EXPO_PUBLIC_ATLAS_SCENES_URL).
+const ATLAS_REPO = 'Armytille/pokeguess-atlas';
+// `<catalog version>-<shard>`: 2026-11-16-07.
+const ATLAS_TAG = /^(\d{4}-\d{2}-\d{2})-(\d{2})$/;
 
 // Per-provider jsDelivr hostnames. `quantil` is the China network (the only one
 // reachable behind the Great Firewall); `fastly` covers EU/US/global; `gcore` has
@@ -83,10 +98,12 @@ const DEFAULT_PROVIDERS = ['default', 'fastly', 'gcore', 'quantil'];
 
 // ── CLI args ───────────────────────────────────────────────────────────────────
 function parseArgs(argv) {
-  const args = { providers: [...DEFAULT_PROVIDERS], concurrency: 24, dryRun: false, timeoutMs: 15000, retries: 2, maxErrorRate: 0.05, proxy: process.env.WARM_PROXY || '' };
+  const args = { target: 'sprites', atlasVersions: 1, providers: [...DEFAULT_PROVIDERS], concurrency: 24, dryRun: false, timeoutMs: 15000, retries: 2, maxErrorRate: 0.05, proxy: process.env.WARM_PROXY || '' };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--dry-run') args.dryRun = true;
+    else if (a === '--target') args.target = argv[++i];
+    else if (a === '--atlas-versions') args.atlasVersions = Math.max(1, parseInt(argv[++i], 10) || 1);
     else if (a === '--providers') args.providers = argv[++i].split(',').map((s) => s.trim()).filter(Boolean);
     else if (a === '--concurrency') args.concurrency = Math.max(1, parseInt(argv[++i], 10) || 24);
     else if (a === '--timeout') args.timeoutMs = Math.max(1000, parseInt(argv[++i], 10) || 15000);
@@ -104,6 +121,10 @@ function parseArgs(argv) {
     else if (a === '--proxy') args.proxy = argv[++i] || '';
     else if (a === '--help' || a === '-h') { printHelp(); process.exit(0); }
   }
+  if (args.target !== 'sprites' && args.target !== 'atlas') {
+    console.error(`Unknown target: ${args.target}. Valid: sprites, atlas`);
+    process.exit(2);
+  }
   const unknown = args.providers.filter((p) => !PROVIDER_HOSTS[p]);
   if (unknown.length) {
     console.error(`Unknown provider(s): ${unknown.join(', ')}. Valid: ${Object.keys(PROVIDER_HOSTS).join(', ')}`);
@@ -115,6 +136,8 @@ function parseArgs(argv) {
 function printHelp() {
   console.log(`warm-jsdelivr — keep PokeGuess sprites warm on jsDelivr edges
 
+  --target <name>       sprites (default) or atlas (the Atlas scenes)
+  --atlas-versions <n>  atlas: how many of the newest catalog versions (default: 1)
   --providers <list>    comma-separated: ${Object.keys(PROVIDER_HOSTS).join(',')} (default: all)
   --concurrency <n>     parallel in-flight HEAD requests per provider (default: 24)
   --timeout <ms>        per-request timeout (default: 15000)
@@ -137,6 +160,51 @@ function buildPaths() {
     paths.push(`${base}/shiny/${id}.webp`);  // shiny
   }
   return paths;
+}
+
+// The Atlas scenes: every file of every tag of the newest catalog versions.
+// One GitHub API call lists the tags, one per tag lists its files (each tag is
+// an orphan commit holding only its shard, ~420 files, far under the tree
+// API's truncation limit).
+async function githubJson(path) {
+  const headers = { Accept: 'application/vnd.github+json', 'User-Agent': 'warm-jsdelivr' };
+  if (process.env.GITHUB_TOKEN) headers.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(`https://api.github.com${path}`, { headers });
+    if (res.ok) return res.json();
+    if (attempt >= 2 || (res.status < 500 && res.status !== 429)) throw new Error(`GitHub API ${path}: HTTP ${res.status}`);
+    await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+  }
+}
+
+async function buildAtlasPaths(versionsWanted) {
+  const tags = [];
+  for (let page = 1; ; page++) {
+    const batch = await githubJson(`/repos/${ATLAS_REPO}/tags?per_page=100&page=${page}`);
+    tags.push(...batch.map((t) => t.name));
+    if (batch.length < 100) break;
+  }
+  const byVersion = new Map();
+  for (const name of tags) {
+    const m = ATLAS_TAG.exec(name);
+    if (!m) continue;
+    if (!byVersion.has(m[1])) byVersion.set(m[1], []);
+    byVersion.get(m[1]).push(name);
+  }
+  // Dates sort as strings: the newest catalogs last.
+  const versions = [...byVersion.keys()].sort().slice(-versionsWanted).reverse();
+  if (versions.length === 0) throw new Error(`no <version>-NN tag in ${ATLAS_REPO}`);
+  const paths = [];
+  for (const version of versions) {
+    for (const tag of byVersion.get(version).sort()) {
+      const tree = await githubJson(`/repos/${ATLAS_REPO}/git/trees/${encodeURIComponent(tag)}?recursive=1`);
+      if (tree.truncated) console.warn(`  ⚠ ${tag}: the tree listing is truncated, some files will stay cold`);
+      for (const entry of tree.tree) {
+        if (entry.type === 'blob' && entry.path.startsWith('pokemon/')) paths.push(`/gh/${ATLAS_REPO}@${tag}/${entry.path}`);
+      }
+    }
+  }
+  return { paths, label: `${ATLAS_REPO} @ ${versions.join(', ')} (${versions.map((v) => byVersion.get(v).length).join(' + ')} tags)` };
 }
 
 // ── HIT/MISS classification ────────────────────────────────────────────────────
@@ -228,7 +296,7 @@ async function resolvableProviders(providers) {
 // proxy is requested we re-launch ourselves once with those set, marking the child
 // via WARM_PROXY_ACTIVE so it doesn't re-exec again. Credentials live in the env,
 // never on the command line (keeps them out of `ps` / CI logs).
-function reExecWithProxy(proxyUrl) {
+function reExecWithProxy(proxyUrl, extraEnv = {}) {
   const { spawnSync } = require('node:child_process');
   // Drop --proxy + its value so the child doesn't loop; it reads the proxy from env.
   const childArgs = [];
@@ -245,15 +313,33 @@ function reExecWithProxy(proxyUrl) {
       HTTP_PROXY: proxyUrl,
       NODE_USE_ENV_PROXY: '1',
       WARM_PROXY_ACTIVE: proxyUrl,
+      ...extraEnv,
     },
   });
+  if (extraEnv.WARM_PATHS_FILE) {
+    try { require('node:fs').unlinkSync(extraEnv.WARM_PATHS_FILE); } catch { /* already gone */ }
+  }
   process.exit(res.status ?? 1);
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────
 async function main() {
   const args = parseArgs(process.argv.slice(2));
-  const paths = buildPaths();
+  let paths;
+  let label = `${ASSETS_REPO}@${ASSETS_TAG}`;
+  let detail = `${ARTWORK_TOTAL} normal + ${ARTWORK_TOTAL} shiny`;
+  if (args.target === 'atlas') {
+    // The list is built once, outside the proxy: the GitHub API calls need no
+    // region, and a proxied child reads the list from the file it is handed.
+    if (process.env.WARM_PATHS_FILE) {
+      ({ paths, label } = JSON.parse(require('node:fs').readFileSync(process.env.WARM_PATHS_FILE, 'utf8')));
+    } else {
+      ({ paths, label } = await buildAtlasPaths(args.atlasVersions));
+    }
+    detail = 'Atlas scene files';
+  } else {
+    paths = buildPaths();
+  }
 
   // Proxy routing uses Node's native env-proxy support, NOT the `undici` package
   // (which is bundled into `fetch` but is NOT importable as a bare module — that
@@ -262,7 +348,11 @@ async function main() {
   // tunnel through the proxy AND resolve DNS proxy-side — so jsDelivr GeoDNS sees
   // the proxy's region (the whole point) instead of the runner's. See reExecWithProxy.
   if (args.proxy && !process.env.WARM_PROXY_ACTIVE) {
-    return reExecWithProxy(args.proxy);
+    if (args.target !== 'atlas') return reExecWithProxy(args.proxy);
+    const fs = require('node:fs');
+    const file = require('node:path').join(require('node:os').tmpdir(), `warm-atlas-${process.pid}.json`);
+    fs.writeFileSync(file, JSON.stringify({ paths, label }));
+    return reExecWithProxy(args.proxy, { WARM_PATHS_FILE: file });
   }
   if (process.env.WARM_PROXY_ACTIVE) {
     const safe = process.env.WARM_PROXY_ACTIVE.replace(/\/\/[^@]*@/, '//***@');
@@ -282,8 +372,8 @@ async function main() {
 
   const totalReq = paths.length * args.providers.length;
 
-  console.log(`warm-jsdelivr → ${ASSETS_REPO}@${ASSETS_TAG}`);
-  console.log(`  files:       ${paths.length} (${ARTWORK_TOTAL} normal + ${ARTWORK_TOTAL} shiny)`);
+  console.log(`warm-jsdelivr → ${label}`);
+  console.log(`  files:       ${paths.length} (${detail})`);
   console.log(`  providers:   ${args.providers.join(', ')}`);
   console.log(`  requests:    ${totalReq} HEAD  (concurrency ${args.concurrency}/provider)`);
   if (args.dryRun) {
