@@ -1,0 +1,72 @@
+# .github/workflows/warm-atlas-proxy.yml
+# Warms the Atlas scenes on the edges of other regions, through the same HTTP
+# proxies as warm-jsdelivr-proxy.yml (secret WEBSHARE_PROXIES, host:port:user:pass
+# per line). The US run (warm-atlas.yml) already fills jsDelivr's origin cache,
+# so a European or Japanese PoP that misses is served from jsDelivr, not from
+# GitHub; this run also fills those PoPs themselves.
+#
+# Quota: Webshare's free tier is 1 GB a month and the sprite run takes about
+# 150 MB a week (600-750 MB a month). One atlas run is ~12,000 HEAD per region
+# on the default host only (the one the app uses): about 60 MB per region,
+# 300 MB for five proxies. Once a month it stays near the limit; in a month
+# with five Sundays the last proxies may run out of quota and the run ends
+# best-effort. Do not schedule it more often without a paid plan.
+
+name: warm-atlas-proxy
+
+on:
+  schedule:
+    # The 3rd of each month, 05:47 UTC (the sprite proxy run is on Sundays).
+    - cron: '47 5 3 * *'
+  workflow_dispatch:
+
+concurrency:
+  group: warm-atlas-proxy
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  warm-proxy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # --use-env-proxy (the script's proxy re-exec) needs Node >= 24.5.
+          node-version: '24'
+
+      - name: Warm each proxy region
+        env:
+          WEBSHARE_PROXIES: ${{ secrets.WEBSHARE_PROXIES }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -z "${WEBSHARE_PROXIES}" ]; then
+            echo "WEBSHARE_PROXIES secret is empty -- nothing to warm."
+            exit 0
+          fi
+          echo "${WEBSHARE_PROXIES}" | while IFS= read -r line; do
+            line="$(echo "$line" | tr -d '\r' | xargs)"
+            [ -z "$line" ] && continue
+            host="$(echo "$line" | cut -d: -f1)"
+            port="$(echo "$line" | cut -d: -f2)"
+            user="$(echo "$line" | cut -d: -f3)"
+            pass="$(echo "$line" | cut -d: -f4)"
+            echo ""
+            echo "=================================================================="
+            echo " Warming the Atlas via proxy ${host}:${port}"
+            geo="$(curl -s --max-time 20 --proxy "http://${user}:${pass}@${host}:${port}" https://ipinfo.io/json | tr -d '\n' || echo '{}')"
+            echo " exit geo: ${geo}"
+            echo "=================================================================="
+            WARM_PROXY="http://${user}:${pass}@${host}:${port}" \
+              node scripts/warm-jsdelivr.mjs \
+                --target atlas \
+                --providers default \
+                --concurrency 16 \
+                --timeout 20000 \
+                --retries 3 \
+                --max-error-rate 0.3 \
+            || echo "proxy ${host}:${port} finished best-effort"
+          done
