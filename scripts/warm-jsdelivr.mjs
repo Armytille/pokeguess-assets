@@ -98,7 +98,7 @@ const DEFAULT_PROVIDERS = ['default', 'fastly', 'gcore', 'quantil'];
 
 // ── CLI args ───────────────────────────────────────────────────────────────────
 function parseArgs(argv) {
-  const args = { target: 'sprites', atlasVersions: 1, providers: [...DEFAULT_PROVIDERS], concurrency: 24, dryRun: false, timeoutMs: 15000, retries: 2, maxErrorRate: 0.05, proxy: process.env.WARM_PROXY || '' };
+  const args = { target: 'sprites', atlasVersions: 1, providers: [...DEFAULT_PROVIDERS], concurrency: 24, dryRun: false, timeoutMs: 15000, retries: 2, maxErrorRate: 0.05, deadlineMin: 0, proxy: process.env.WARM_PROXY || '' };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--dry-run') args.dryRun = true;
@@ -112,6 +112,10 @@ function parseArgs(argv) {
     // 5% for the reliable direct pipeline; raise it (e.g. 0.5) for flaky transports
     // where a partial warm is still a useful warm.
     else if (a === '--max-error-rate') args.maxErrorRate = Math.min(1, Math.max(0, parseFloat(argv[++i]) || 0.05));
+    // Stop taking new files after this many minutes and report what was done.
+    // A CI job that hits its own timeout is cancelled with no summary at all
+    // (the proxy runs ended that way every week from 2026-10 to 2026-11).
+    else if (a === '--deadline') args.deadlineMin = Math.max(0, parseFloat(argv[++i]) || 0);
     // Route all requests through an HTTP proxy (e.g. http://user:pass@host:port).
     // This is how we warm NON-US edges: a proxy in DE/JP makes jsDelivr's GeoDNS
     // see that region's IP AND resolves DNS proxy-side, so routing matches the
@@ -143,6 +147,7 @@ function printHelp() {
   --timeout <ms>        per-request timeout (default: 15000)
   --retries <n>         transient-failure retries per URL (default: 2)
   --max-error-rate <f>  fail the run above this error fraction (default: 0.05)
+  --deadline <min>      stop taking new files after this many minutes (default: none)
   --proxy <url>         route via HTTP proxy http://user:pass@host:port
                         (or set WARM_PROXY env var) — warms that proxy's region
   --dry-run             print the plan, make no requests
@@ -229,40 +234,94 @@ function classifyCache(headers) {
 }
 
 // ── One warming request (HEAD) with bounded retries ──────────────────────────
+// Bytes of one HEAD exchange on a kept-alive connection: the request line and
+// headers (measured with curl: ~150 B) plus the response headers. A proxy's
+// quota counts these, so the summary reports the sum.
+const REQUEST_BYTES = 160;
+function headerBytes(headers) {
+  let n = 17; // status line
+  for (const [k, v] of headers) n += k.length + v.length + 4;
+  return n;
+}
+
+// Why a request failed, in a few words: undici hides the cause one level down
+// ("fetch failed" → "Proxy response (402) !== 200 when HTTP Tunneling",
+// ECONNREFUSED, a timeout). The first few distinct ones go into the log.
+function errorReason(err) {
+  if (err?.name === 'AbortError') return 'no answer before --timeout';
+  const cause = err?.cause;
+  return String(cause?.code || cause?.message || err?.message || err).slice(0, 160);
+}
+
 async function warmOne(url, { timeoutMs, retries }) {
+  let reason = '';
   for (let attempt = 0; attempt <= retries; attempt++) {
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), timeoutMs);
     try {
       const res = await fetch(url, { method: 'HEAD', redirect: 'follow', signal: ctl.signal });
       clearTimeout(timer);
-      if (res.ok) return { ok: true, cache: classifyCache(res.headers), status: res.status };
+      const bytes = REQUEST_BYTES + headerBytes(res.headers);
+      if (res.ok) return { ok: true, cache: classifyCache(res.headers), status: res.status, bytes };
       // 4xx (other than 408/429) won't improve on retry — a genuinely missing file.
       if (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) {
-        return { ok: false, cache: 'ERR', status: res.status };
+        return { ok: false, cache: 'ERR', status: res.status, bytes, reason: `HTTP ${res.status}` };
       }
+      reason = `HTTP ${res.status}`;
       // 5xx/408/429 → fall through to backoff.
-    } catch {
+    } catch (err) {
       clearTimeout(timer);
+      reason = errorReason(err);
       // network error / timeout / abort → retry
     }
     if (attempt < retries) await new Promise((r) => setTimeout(r, 300 * Math.pow(2, attempt)));
   }
-  return { ok: false, cache: 'ERR', status: 0 };
+  return { ok: false, cache: 'ERR', status: 0, bytes: 0, reason };
+}
+
+// ── Proxy check ────────────────────────────────────────────────────────────────
+// A proxy that is gone (free proxy lists rotate) or out of quota fails every
+// request, and each one waits out --timeout and its retries: with 2,000 files
+// that is hours, and the CI job was cancelled at its limit before it printed a
+// line. Four requests up front tell a working proxy from a dead one in seconds.
+async function proxyWorks(url, timeoutMs) {
+  const results = [];
+  for (let i = 0; i < 4; i++) results.push(await warmOne(url, { timeoutMs: Math.min(timeoutMs, 15000), retries: 0 }));
+  const ok = results.filter((r) => r.ok).length;
+  return { ok: ok >= 2, detail: `${ok}/4 answered${ok < 4 ? ` (${[...new Set(results.filter((r) => !r.ok).map((r) => r.reason))].join('; ')})` : ''}` };
 }
 
 // ── Bounded-concurrency pool over a path list for one provider ─────────────────
-async function warmProvider(provider, host, paths, opts) {
-  const stats = { provider, total: paths.length, ok: 0, err: 0, HIT: 0, MISS: 0, UNKNOWN: 0 };
+// Stop a provider whose requests keep failing: past BREAKER_MIN requests, an
+// error rate above BREAKER_RATE means the path is down (a dead proxy, a quota
+// spent), and going on only burns the job's time.
+const BREAKER_MIN = 200;
+const BREAKER_RATE = 0.5;
+const PROGRESS_EVERY = 2000;
+
+async function warmProvider(provider, host, paths, opts, deadline) {
+  const stats = { provider, total: paths.length, done: 0, ok: 0, err: 0, HIT: 0, MISS: 0, UNKNOWN: 0, bytes: 0, reasons: new Map(), stopped: '' };
   let cursor = 0;
   const started = Date.now();
 
   const worker = async () => {
-    while (cursor < paths.length) {
+    while (cursor < paths.length && !stats.stopped) {
+      if (deadline && Date.now() > deadline) { stats.stopped = 'deadline reached'; break; }
       const url = `https://${host}${paths[cursor++]}`;
       const r = await warmOne(url, opts);
+      stats.done++;
+      stats.bytes += r.bytes;
       if (r.ok) { stats.ok++; stats[r.cache] = (stats[r.cache] || 0) + 1; }
-      else stats.err++;
+      else {
+        stats.err++;
+        stats.reasons.set(r.reason, (stats.reasons.get(r.reason) || 0) + 1);
+        if (stats.done >= BREAKER_MIN && stats.err > stats.done * BREAKER_RATE && !stats.stopped) {
+          stats.stopped = `${stats.err} of ${stats.done} requests failed`;
+        }
+      }
+      if (stats.done % PROGRESS_EVERY === 0) {
+        process.stdout.write(`\n  … ${stats.done}/${paths.length}  HIT=${stats.HIT} MISS=${stats.MISS} err=${stats.err}  ${((Date.now() - started) / 1000).toFixed(0)}s`);
+      }
     }
   };
 
@@ -382,33 +441,51 @@ async function main() {
     return;
   }
 
+  // Through a proxy, check it carries requests at all before the long run.
+  if (process.env.WARM_PROXY_ACTIVE) {
+    const check = await proxyWorks(`https://${PROVIDER_HOSTS[args.providers[0]]}${paths[0]}`, args.timeoutMs);
+    console.log(`  proxy check: ${check.detail}`);
+    if (!check.ok) {
+      console.error('\nFAIL: the proxy does not carry requests (gone, refused, or out of quota). Replace it in the WEBSHARE_PROXIES secret.');
+      process.exit(3);
+    }
+  }
+
+  const deadline = args.deadlineMin > 0 ? Date.now() + args.deadlineMin * 60_000 : 0;
   const results = [];
   // Providers run sequentially so we don't thrash the local NIC with
   // concurrency × providers sockets at once; each provider gets a clean budget.
   for (const p of args.providers) {
+    if (deadline && Date.now() > deadline) { console.log(`\n[${p}] skipped: deadline reached`); continue; }
     process.stdout.write(`\n[${p}] warming ${paths.length} files … `);
-    const s = await warmProvider(p, PROVIDER_HOSTS[p], paths, args);
+    const s = await warmProvider(p, PROVIDER_HOSTS[p], paths, args, deadline);
     results.push(s);
-    console.log(`done in ${(s.elapsedMs / 1000).toFixed(1)}s`);
+    console.log(`\n  done in ${(s.elapsedMs / 1000).toFixed(1)}s${s.stopped ? `, STOPPED (${s.stopped}) after ${s.done}/${s.total}` : ''}`);
     console.log(`  ok=${s.ok} err=${s.err}  |  HIT=${s.HIT} MISS=${s.MISS} UNKNOWN=${s.UNKNOWN}`);
+    for (const [reason, count] of [...s.reasons].sort((a, b) => b[1] - a[1]).slice(0, 3)) console.log(`  error ×${count}: ${reason}`);
   }
 
   // ── Summary + exit code ──────────────────────────────────────────────────────
   const totErr = results.reduce((n, s) => n + s.err, 0);
   const totHit = results.reduce((n, s) => n + s.HIT, 0);
   const totOk  = results.reduce((n, s) => n + s.ok, 0);
+  const totDone = results.reduce((n, s) => n + s.done, 0);
+  const totBytes = results.reduce((n, s) => n + s.bytes, 0);
   const hitRate = totOk ? ((totHit / totOk) * 100).toFixed(1) : '0.0';
   console.log(`\n──────── summary ────────`);
-  console.log(`  reachable: ${totOk}/${totalReq}   errors: ${totErr}`);
+  console.log(`  reachable: ${totOk}/${totalReq}   errors: ${totErr}   not reached: ${totalReq - totDone}`);
   console.log(`  warm (HIT): ${totHit}/${totOk}  (${hitRate}%)`);
+  console.log(`  traffic: ≈ ${(totBytes / 1e6).toFixed(1)} MB of headers (plus one TLS handshake per connection)`);
   console.log(`  note: a high MISS rate on the FIRST run is expected — those requests`);
   console.log(`        just warmed the edge. The next run should report mostly HIT.`);
 
   // Fail the CI job only if too large a fraction of files were unreachable. The
   // threshold is configurable (--max-error-rate) so flaky transports tolerate a
-  // higher miss rate while the direct pipeline stays strict at 5%.
-  if (totErr > totalReq * args.maxErrorRate) {
-    console.error(`\nFAIL: ${totErr} errors exceed ${(args.maxErrorRate * 100).toFixed(0)}% of ${totalReq} requests.`);
+  // higher miss rate while the direct pipeline stays strict at 5%. A provider
+  // stopped by its errors fails the run too: its files stayed cold.
+  const stopped = results.filter((s) => s.stopped && s.stopped !== 'deadline reached');
+  if (totErr > Math.max(1, totDone) * args.maxErrorRate || stopped.length) {
+    console.error(`\nFAIL: ${totErr} errors in ${totDone} requests${stopped.length ? `; stopped: ${stopped.map((s) => s.provider).join(', ')}` : ''}.`);
     process.exit(1);
   }
 }
